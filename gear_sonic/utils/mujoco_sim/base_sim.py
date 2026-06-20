@@ -61,6 +61,15 @@ class DefaultEnv:
         self.unitree_bridge = None
         self.onscreen = onscreen
 
+        # Keyboard gripper control: press G to toggle; overrides DDS hand commands
+        self._gripper_keyboard_active = False  # True once 'G' is pressed at least once
+        self._gripper_closed = False
+        # Closed joint targets from G1GripperInverseKinematicsSolver._get_middle_close_q_desired
+        self._GRIPPER_LEFT_CLOSED = np.array([0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5])
+        self._GRIPPER_RIGHT_CLOSED = np.array([0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5])
+        self._GRIPPER_KP = 1.5
+        self._GRIPPER_KD = 0.1
+
         self.init_scene()
         self.last_reward = 0
 
@@ -302,32 +311,49 @@ class DefaultEnv:
         right_hand_torques = np.zeros(self.num_hand_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_hand_motor):
-                left_hand_torques[i] = (
-                    self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                if self._gripper_keyboard_active:
+                    # Keyboard override: bypass DDS targets, use toggle state directly
+                    lq = self._GRIPPER_LEFT_CLOSED[i] if self._gripper_closed else 0.0
+                    rq = self._GRIPPER_RIGHT_CLOSED[i] if self._gripper_closed else 0.0
+                    left_hand_torques[i] = (
+                        self._GRIPPER_KP
+                        * (lq - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1])
+                        - self._GRIPPER_KD
+                        * self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
                     )
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                    right_hand_torques[i] = (
+                        self._GRIPPER_KP
+                        * (rq - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1])
+                        - self._GRIPPER_KD
+                        * self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
                     )
-                )
-                right_hand_torques[i] = (
-                    self.unitree_bridge.right_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                else:
+                    left_hand_torques[i] = (
+                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
+                        + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
+                        * (
+                            self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
+                            - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                        )
+                        + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
+                        * (
+                            self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
+                            - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                        )
                     )
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                    right_hand_torques[i] = (
+                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].tau
+                        + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
+                        * (
+                            self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
+                            - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                        )
+                        + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
+                        * (
+                            self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
+                            - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                        )
                     )
-                )
         return np.concatenate((left_hand_torques, right_hand_torques))
 
     def compute_body_qpos(self) -> np.ndarray:
@@ -504,6 +530,10 @@ class DefaultEnv:
             self.update_viewer_camera()
         if key in ["up", "down", "left", "right"]:
             self.apply_perturbation(key)
+        if key == "g" and self.num_hand_dof > 0:
+            self._gripper_keyboard_active = True
+            self._gripper_closed = not self._gripper_closed
+            print(f"[Sim] Gripper: {'CLOSED' if self._gripper_closed else 'OPEN'}")
 
     def check_fall(self):
         self.fall = False

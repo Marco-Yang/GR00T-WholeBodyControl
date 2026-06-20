@@ -239,7 +239,7 @@ CHECKPOINT_DEFAULT="policy/release/model"
 OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
 MOTION_DATA_DEFAULT="reference/example/"
-INPUT_TYPE_DEFAULT="manager"
+INPUT_TYPE_DEFAULT="zmq_manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
 

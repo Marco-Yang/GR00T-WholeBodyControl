@@ -600,6 +600,100 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
 #     return compute_from_body_poses(parent_indices, device, body_poses_np)
 
 
+# DEX-3 fallback closed positions when IK solver unavailable
+# Values match G1GripperInverseKinematicsSolver._get_middle_close_q_desired()
+_DEX3_LEFT_CLOSED_Q = np.array([0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5], dtype=np.float32)
+_DEX3_RIGHT_CLOSED_Q = np.array([0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5], dtype=np.float32)
+
+# DEX-3 hold-to-move speeds (ratio/s → full travel ≈ 4s)
+_DEX3_GRASP_SPEED = 0.25
+_DEX3_RELEASE_SPEED = 0.25
+_DEX3_TRIGGER_THRESHOLD = 0.5
+
+
+class _Dex3MotionState(Enum):
+    HOLD = "hold"
+    GRASPING = "grasping"
+    RELEASING = "releasing"
+
+
+class _Dex3HandController:
+    """Single-hand hold-to-move controller.
+
+    Hold grasp_btn  → slowly close.
+    Hold release_btn→ slowly open.
+    Release both    → freeze at current position.
+    Trigger held    → freeze (highest priority); resumes when released.
+    """
+
+    def __init__(self, hand_name: str, q_closed: np.ndarray):
+        self.hand_name = hand_name
+        self.q_open = np.zeros(7, dtype=np.float32)
+        self.q_closed = np.asarray(q_closed, dtype=np.float32).reshape(7)
+        self.close_ratio = 0.0
+        self.state = _Dex3MotionState.HOLD
+
+    def process_buttons(self, grasp_btn: bool, release_btn: bool, trigger: float) -> None:
+        if trigger > _DEX3_TRIGGER_THRESHOLD:
+            if self.state != _Dex3MotionState.HOLD:
+                print(f"[Gripper/{self.hand_name}] trigger pause (ratio={self.close_ratio:.2f})")
+            self.state = _Dex3MotionState.HOLD
+            return
+        if grasp_btn:
+            if self.state != _Dex3MotionState.GRASPING:
+                print(f"[Gripper/{self.hand_name}] closing (ratio={self.close_ratio:.2f})")
+                self.state = _Dex3MotionState.GRASPING
+        elif release_btn:
+            if self.state != _Dex3MotionState.RELEASING:
+                print(f"[Gripper/{self.hand_name}] opening (ratio={self.close_ratio:.2f})")
+                self.state = _Dex3MotionState.RELEASING
+        else:
+            self.state = _Dex3MotionState.HOLD
+
+    def update(self, dt: float) -> np.ndarray:
+        if self.state == _Dex3MotionState.GRASPING:
+            self.close_ratio = min(1.0, self.close_ratio + _DEX3_GRASP_SPEED * dt)
+        elif self.state == _Dex3MotionState.RELEASING:
+            self.close_ratio = max(0.0, self.close_ratio - _DEX3_RELEASE_SPEED * dt)
+        return self.q_open + self.close_ratio * (self.q_closed - self.q_open)
+
+
+class Dex3DualHandController:
+    """PICO4 → DEX-3 hold-to-move mapping.
+
+    Right hand: hold A = close, hold B = open, right trigger = pause
+    Left  hand: hold X = close, hold Y = open, left  trigger = pause
+    """
+
+    def __init__(self, left_solver=None, right_solver=None):
+        left_closed = (
+            np.asarray(left_solver._get_middle_close_q_desired(), dtype=np.float32)
+            if left_solver is not None
+            else _DEX3_LEFT_CLOSED_Q.copy()
+        )
+        right_closed = (
+            np.asarray(right_solver._get_middle_close_q_desired(), dtype=np.float32)
+            if right_solver is not None
+            else _DEX3_RIGHT_CLOSED_Q.copy()
+        )
+        self._left = _Dex3HandController("left", left_closed)
+        self._right = _Dex3HandController("right", right_closed)
+
+    def update(
+        self,
+        a_pressed: bool,
+        b_pressed: bool,
+        x_pressed: bool,
+        y_pressed: bool,
+        left_trigger: float,
+        right_trigger: float,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self._right.process_buttons(a_pressed, b_pressed, right_trigger)
+        self._left.process_buttons(x_pressed, y_pressed, left_trigger)
+        return self._left.update(dt).reshape(1, 7), self._right.update(dt).reshape(1, 7)
+
+
 def init_hand_ik_solvers():
     """Initialize hand IK solvers if available."""
     if G1GripperInverseKinematicsSolver is not None:
@@ -1180,6 +1274,7 @@ class PoseStreamer:
         use_cuda: bool,
         record_dir: str,
         record_format: str,
+        hand_controller: "Dex3DualHandController | None" = None,
         log_prefix: str = "PoseLoop",
     ):
         self.socket = socket
@@ -1188,6 +1283,8 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.hand_controller = hand_controller if hand_controller is not None else Dex3DualHandController()
+        self._last_hand_update_mono: float | None = None
 
         # Injected dependencies
         self.reader = reader
@@ -1253,11 +1350,17 @@ class PoseStreamer:
             True  # Start with buffer cleared - wait for full buffer before first send
         )
         self.yaw_accumulator = YawAccumulator()
+        # Per-hand suppress flags: set on POSE entry to prevent the A+X mode-switch
+        # combo from immediately triggering both grippers.  Each flag clears as soon
+        # as its own button (A for right, X for left) is released — independently.
+        self._suppress_right_gripper = False
+        self._suppress_left_gripper = False
 
     def reset_yaw(self):
-        """Called when entering pose mode. Resets yaw only.
-        Calibration is triggered separately by the operator (A+B+X+Y → calibrate_now)."""
+        """Called when entering pose mode. Resets yaw and suppresses grippers until A/X released."""
         self.yaw_accumulator.reset()
+        self._suppress_right_gripper = True
+        self._suppress_left_gripper = True
 
     def on_mode_exit(self):
         self.frame_buffer.clear()
@@ -1298,13 +1401,32 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
+        now_mono = time.monotonic()
+        if self._last_hand_update_mono is None:
+            hand_dt = self.frame_time
+        else:
+            hand_dt = max(0.001, now_mono - self._last_hand_update_mono)
+        self._last_hand_update_mono = now_mono
+
+        # Suppress A/X gripper inputs after entering POSE mode via A+X combo.
+        # Each hand clears independently once its own button is released,
+        # so the right hand (A) and left hand (X) don't have to be released in sync.
+        if self._suppress_right_gripper:
+            if not a_pressed:
+                self._suppress_right_gripper = False
+            a_gripper = False
+        else:
+            a_gripper = a_pressed
+
+        if self._suppress_left_gripper:
+            if not x_pressed:
+                self._suppress_left_gripper = False
+            x_gripper = False
+        else:
+            x_gripper = x_pressed
+
+        left_hand_joints, right_hand_joints = self.hand_controller.update(
+            a_gripper, b_pressed, x_gripper, y_pressed, left_trigger, right_trigger, hand_dt
         )
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
@@ -1630,6 +1752,7 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        hand_controller: "Dex3DualHandController | None" = None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1648,8 +1771,8 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.hand_controller = hand_controller if hand_controller is not None else Dex3DualHandController()
+        self._last_hand_update_mono: float | None = None
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1756,22 +1879,16 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
+                now_mono = time.monotonic()
+                if self._last_hand_update_mono is None:
+                    hand_dt = self.dt
+                else:
+                    hand_dt = max(0.001, now_mono - self._last_hand_update_mono)
+                self._last_hand_update_mono = now_mono
+                (_, left_trigger_h, right_trigger_h, _, _) = get_controller_inputs()
+                lh_joints, rh_joints = self.hand_controller.update(
+                    a_pressed, b_pressed, x_pressed, y_pressed,
+                    left_trigger_h, right_trigger_h, hand_dt,
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
@@ -1863,6 +1980,11 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
+    left_ik, right_ik = init_hand_ik_solvers()
+    hand_controller = Dex3DualHandController(left_ik, right_ik)
+    print("[Manager] Gripper: Hold X=close / Y=open (left hand), Hold A=close / B=open (right hand)")
+    print("[Manager]          Left trigger = left pause, Right trigger = right pause")
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -1872,6 +1994,7 @@ def run_pico_manager(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
+        hand_controller=hand_controller,
         log_prefix="PoseLoop",
     )
     planner_streamer = PlannerStreamer(
@@ -1881,6 +2004,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        hand_controller=hand_controller,
     )
 
     # State machine diagram:
@@ -1890,10 +2014,12 @@ def run_pico_manager(
     #                                                                         |
     #                                                                    (by)--> POSE
     #
-    #   Chain 2 (ax_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(ax)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                        |
-    #                                                   (ax)--> POSE
+    #   Chain 2 (ax_pressed enters/exits):
+    #     POSE <--(ax)--> PLANNER
+    #
+    #   Gripper (any active mode):
+    #     Right hand: hold A=close, hold B=open, right_trigger=pause
+    #     Left  hand: hold X=close, hold Y=open, left_trigger=pause
     #
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
@@ -1940,13 +2066,11 @@ def run_pico_manager(
                         print("[Manager] WARNING: No SMPL data available for calibration")
 
             elif current_mode == StreamMode.PLANNER:
-                # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
+                # Chain 2: POSE <--(ax)--> PLANNER
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
                 if start_combo and not prev_start_combo:
@@ -2074,6 +2198,10 @@ def run_pico_manager(
         three_point.close()
         socket.close()
         context.term()
+        try:
+            xrt.close()
+        except Exception:
+            pass
         print("[Manager] Shutdown complete")
 
 
