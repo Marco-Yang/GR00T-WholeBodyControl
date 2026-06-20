@@ -29,6 +29,11 @@ import subprocess
 import threading
 import time
 
+# Bypass HTTP proxy for local gRPC connection to XRoboToolkit service (127.0.0.1:60061).
+# Without this, gRPC gets routed through the system proxy and never connects.
+os.environ["no_proxy"] = "127.0.0.1,localhost," + os.environ.get("no_proxy", "")
+os.environ["NO_PROXY"] = "127.0.0.1,localhost," + os.environ.get("NO_PROXY", "")
+
 import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation as R, Rotation as sRot

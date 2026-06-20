@@ -544,7 +544,7 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm < /dev/tty
 
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
