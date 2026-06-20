@@ -512,6 +512,103 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     return fingertips
 
 
+class Dex3HandMotionState(Enum):
+    HOLD = "hold"
+    GRASPING = "grasping"
+    RELEASING = "releasing"
+
+
+# DEX-3 three-finger grasp: ~4s for full close/open
+DEX3_HAND_GRASP_SPEED = 0.25
+DEX3_HAND_RELEASE_SPEED = 0.25
+DEX3_HAND_TRIGGER_THRESHOLD = 0.5
+
+
+class Dex3HandButtonController:
+    """Per-hand hold-to-move control: grasp/release while held, stop on release; trigger overrides."""
+
+    def __init__(self, hand_name: str, q_closed: np.ndarray):
+        self.hand_name = hand_name
+        self.q_open = np.zeros(7, dtype=np.float32)
+        self.q_closed = np.asarray(q_closed, dtype=np.float32).reshape(7)
+        self.close_ratio = 0.0
+        self.state = Dex3HandMotionState.HOLD
+
+    def on_grasp(self) -> None:
+        self.state = Dex3HandMotionState.GRASPING
+        print(f"[Dex3Hand] {self.hand_name}: slow grasp (ratio={self.close_ratio:.2f})")
+
+    def on_release(self) -> None:
+        self.state = Dex3HandMotionState.RELEASING
+        print(f"[Dex3Hand] {self.hand_name}: slow release (ratio={self.close_ratio:.2f})")
+
+    def on_stop(self) -> None:
+        if self.state != Dex3HandMotionState.HOLD:
+            print(f"[Dex3Hand] {self.hand_name}: stop (hold ratio={self.close_ratio:.2f})")
+        self.state = Dex3HandMotionState.HOLD
+
+    def process_buttons(self, grasp_btn: bool, release_btn: bool, trigger: float) -> None:
+        trigger_pressed = trigger > DEX3_HAND_TRIGGER_THRESHOLD
+        # Trigger has highest priority: while held, freeze at current ratio.
+        if trigger_pressed:
+            self.on_stop()
+            return
+        if grasp_btn:
+            if self.state != Dex3HandMotionState.GRASPING:
+                self.on_grasp()
+        elif release_btn:
+            if self.state != Dex3HandMotionState.RELEASING:
+                self.on_release()
+        else:
+            # Face button released: stop immediately at current ratio.
+            self.on_stop()
+
+    def update(self, dt: float) -> np.ndarray:
+        if self.state == Dex3HandMotionState.GRASPING:
+            self.close_ratio = min(1.0, self.close_ratio + DEX3_HAND_GRASP_SPEED * dt)
+        elif self.state == Dex3HandMotionState.RELEASING:
+            self.close_ratio = max(0.0, self.close_ratio - DEX3_HAND_RELEASE_SPEED * dt)
+        return self.q_open + self.close_ratio * (self.q_closed - self.q_open)
+
+
+class Dex3DualHandController:
+    """
+    PICO4 Ultra -> Unitree DEX-3 hand mapping (hold-to-move):
+      Right: hold A = slow grasp, hold B = slow release, release = stop, trigger = stop (priority)
+      Left:  hold X = slow grasp, hold Y = slow release, release = stop, trigger = stop (priority)
+    """
+
+    def __init__(self, left_solver=None, right_solver=None):
+        left_closed = (
+            left_solver._get_middle_close_q_desired()
+            if left_solver is not None
+            else np.zeros(7)
+        )
+        right_closed = (
+            right_solver._get_middle_close_q_desired()
+            if right_solver is not None
+            else np.zeros(7)
+        )
+        self.left = Dex3HandButtonController("left", left_closed)
+        self.right = Dex3HandButtonController("right", right_closed)
+
+    def update(
+        self,
+        a_pressed: bool,
+        b_pressed: bool,
+        x_pressed: bool,
+        y_pressed: bool,
+        left_trigger: float,
+        right_trigger: float,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self.right.process_buttons(a_pressed, b_pressed, right_trigger)
+        self.left.process_buttons(x_pressed, y_pressed, left_trigger)
+        left_joints = self.left.update(dt)
+        right_joints = self.right.update(dt)
+        return left_joints, right_joints
+
+
 # Joystick deadzone threshold
 JOYSTICK_DEADZONE = 0.15
 
@@ -693,18 +790,25 @@ def get_abxy_buttons():
 
 
 def compute_hand_joints_from_inputs(
-    left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
+    hand_controller: Dex3DualHandController,
+    a_pressed: bool,
+    b_pressed: bool,
+    x_pressed: bool,
+    y_pressed: bool,
+    left_trigger: float,
+    right_trigger: float,
+    dt: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
-    if left_solver is not None and right_solver is not None:
-        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
-        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
-        left_hand_joints = left_solver({"position": left_finger_data})
-        right_hand_joints = right_solver({"position": right_finger_data})
-    else:
-        left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-        right_hand_joints = np.zeros((1, 7), dtype=np.float32)
-    return left_hand_joints, right_hand_joints
+    """Compute left/right DEX-3 hand joints from PICO button mapping."""
+    return hand_controller.update(
+        a_pressed,
+        b_pressed,
+        x_pressed,
+        y_pressed,
+        left_trigger,
+        right_trigger,
+        dt,
+    )
 
 
 def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -840,6 +944,9 @@ def _pose_stream_common(
         log_prefix=log_prefix,
     )
 
+    left_hand_ik_solver, right_hand_ik_solver = init_hand_ik_solvers()
+    hand_controller = Dex3DualHandController(left_hand_ik_solver, right_hand_ik_solver)
+
     streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -849,6 +956,7 @@ def _pose_stream_common(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
+        hand_controller=hand_controller,
         log_prefix=log_prefix,
     )
 
@@ -1175,6 +1283,7 @@ class PoseStreamer:
         use_cuda: bool,
         record_dir: str,
         record_format: str,
+        hand_controller: Dex3DualHandController,
         log_prefix: str = "PoseLoop",
     ):
         self.socket = socket
@@ -1196,7 +1305,7 @@ class PoseStreamer:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
 
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.hand_controller = hand_controller
         self.parent_indices = [
             -1,
             0,
@@ -1239,6 +1348,7 @@ class PoseStreamer:
         self.prev_body_quat_np = None
         self.next_target_ns = None
         self.frame_start = time.time()
+        self._last_hand_update_mono = None
 
         # Data collection button state tracking (edge-triggered)
         self.toggle_data_collection_last = False
@@ -1263,6 +1373,42 @@ class PoseStreamer:
         self.next_target_ns = None
         self.buffer_cleared = True
         self.step = 0
+        self._last_hand_update_mono = None
+
+    def _hand_update_dt(self) -> float:
+        now = time.monotonic()
+        if self._last_hand_update_mono is None:
+            dt = self.frame_time
+        else:
+            dt = now - self._last_hand_update_mono
+            dt = max(0.0, min(dt, 0.1))
+        self._last_hand_update_mono = now
+        return dt
+
+    def _pace_frame(self) -> None:
+        elapsed = time.time() - self.frame_start
+        if elapsed < self.frame_time:
+            time.sleep(self.frame_time - elapsed)
+        self.frame_start = time.time()
+
+    def _send_hand_joints_zmq(
+        self, left_hand_joints: np.ndarray, right_hand_joints: np.ndarray
+    ) -> None:
+        self.socket.send(
+            pack_pose_message(
+                {
+                    "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
+                    "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
+                },
+                topic="pose",
+            )
+        )
+
+    def _finish_hand_only_frame(
+        self, left_hand_joints: np.ndarray, right_hand_joints: np.ndarray
+    ) -> None:
+        self._send_hand_joints_zmq(left_hand_joints, right_hand_joints)
+        self._pace_frame()
 
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
@@ -1294,12 +1440,14 @@ class PoseStreamer:
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
         left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
+            self.hand_controller,
+            a_pressed,
+            b_pressed,
+            x_pressed,
+            y_pressed,
             left_trigger,
-            left_grip,
             right_trigger,
-            right_grip,
+            self._hand_update_dt(),
         )
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
@@ -1318,14 +1466,17 @@ class PoseStreamer:
             self.prev_smpl_joints_np = smpl_joints_np
             self.prev_body_quat_np = body_quat_np
             self.next_target_ns = curr_stamp_ns
+            self._finish_hand_only_frame(left_hand_joints, right_hand_joints)
             return
         if curr_stamp_ns <= self.prev_stamp_ns:
+            self._finish_hand_only_frame(left_hand_joints, right_hand_joints)
             return
         if self.next_target_ns is None:
             self.next_target_ns = self.prev_stamp_ns + step_ns
         if self.next_target_ns < self.prev_stamp_ns:
             self.next_target_ns = self.prev_stamp_ns
         if self.next_target_ns > curr_stamp_ns:
+            self._finish_hand_only_frame(left_hand_joints, right_hand_joints)
             return
         denom = float(curr_stamp_ns - self.prev_stamp_ns)
         alpha = float(self.next_target_ns - self.prev_stamp_ns) / denom if denom > 0.0 else 1.0
@@ -1486,10 +1637,7 @@ class PoseStreamer:
             print(f"[{self.log_prefix}] FPS: {fps:.2f}, Step: {self.step}")
             self.fps_counter = 0
             self.last_fps_report = current_time
-        elapsed = time.time() - self.frame_start
-        if elapsed < self.frame_time:
-            time.sleep(self.frame_time - elapsed)
-        self.frame_start = time.time()
+        self._pace_frame()
 
 
 def run_pico(
@@ -1622,6 +1770,7 @@ class PlannerStreamer:
         socket,
         reader: PicoReader,
         three_point: ThreePointPose,
+        hand_controller: Dex3DualHandController,
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
@@ -1643,8 +1792,8 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        # Hand controller for DEX-3 button mapping in VR 3PT mode
+        self.hand_controller = hand_controller
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1751,22 +1900,24 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
+                # DEX-3 hand control via PICO button mapping in VR 3PT mode
                 (
-                    left_menu_button,
+                    _left_menu_button,
                     left_trigger,
                     right_trigger,
-                    left_grip,
-                    right_grip,
+                    _left_grip,
+                    _right_grip,
                 ) = get_controller_inputs()
+                a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
                 lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
+                    self.hand_controller,
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
                     left_trigger,
-                    left_grip,
                     right_trigger,
-                    right_grip,
+                    self.dt,
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
@@ -1858,6 +2009,14 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
+    left_hand_ik_solver, right_hand_ik_solver = init_hand_ik_solvers()
+    hand_controller = Dex3DualHandController(left_hand_ik_solver, right_hand_ik_solver)
+    print(
+        "[Manager] DEX-3 hand mapping: "
+        "Right A=slow grasp, B=slow release, trigger=stop | "
+        "Left X=slow grasp, Y=slow release, trigger=stop"
+    )
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -1867,12 +2026,14 @@ def run_pico_manager(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
+        hand_controller=hand_controller,
         log_prefix="PoseLoop",
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
         reader=reader,
         three_point=three_point,
+        hand_controller=hand_controller,
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
