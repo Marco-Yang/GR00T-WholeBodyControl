@@ -48,6 +48,8 @@ class RealSenseConfig:
 class RealSenseSensor(Sensor, SensorServer):
     """Sensor for Intel RealSense depth cameras."""
 
+    _shared_ctx: "rs.context | None" = None
+
     def __init__(
         self,
         run_as_server: bool = False,
@@ -58,7 +60,9 @@ class RealSenseSensor(Sensor, SensorServer):
         device_id: str | None = None,
         enable_depth: bool | None = None,
     ):
-        devices = list(rs.context().query_devices())
+        if RealSenseSensor._shared_ctx is None:
+            RealSenseSensor._shared_ctx = rs.context()
+        devices = list(RealSenseSensor._shared_ctx.query_devices())
         if len(devices) == 0:
             raise RuntimeError("No RealSense devices found")
 
