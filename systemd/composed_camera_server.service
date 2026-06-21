@@ -36,25 +36,25 @@ After=network.target
 Type=simple
 
 # ── EDIT THESE for your robot ────────────────────────────────────
-User=nvidia
-Environment="HOME=/home/nvidia"
-Environment="REPO_DIR=/home/nvidia/GR00T-WholeBodyControl"
+User=unitree
+Environment="HOME=/home/unitree"
+Environment="REPO_DIR=/home/unitree/Humanoid/GR00T-WholeBodyControl"
 # ─────────────────────────────────────────────────────────────────
 
-WorkingDirectory=${REPO_DIR}
+WorkingDirectory=/home/unitree/Humanoid/GR00T-WholeBodyControl
 
-# Edit the ExecStart line to match your camera setup.
-# Single ego-view OAK camera (device ID required when multiple OAK devices connected):
-ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_camera \
-    --ego-view-camera oak \
-    --ego-view-device-id YOUR_MXID_HERE \
+# Unitree G1 wrist cameras (Intel RealSense D405)
+# SN=260522278617 -> left wrist (index 0), SN=260622271155 -> right wrist (index 1)
+ExecStart=/home/unitree/Humanoid/GR00T-WholeBodyControl/.venv_camera/bin/python -m gear_sonic.camera.composed_camera \
+    --left-wrist-camera realsense --left-wrist-device-id 0 \
+    --right-wrist-camera realsense --right-wrist-device-id 1 \
     --port 5555
 
-# Multi-camera example (ego + wrist cameras):
-# ExecStart=${REPO_DIR}/.venv_camera/bin/python -m gear_sonic.camera.composed_camera \
-#     --ego-view-camera oak --ego-view-device-id EGO_MXID \
-#     --left-wrist-camera oak --left-wrist-device-id LEFT_MXID \
-#     --right-wrist-camera oak --right-wrist-device-id RIGHT_MXID \
+# Full 3-camera setup (add when head camera is resolved):
+# ExecStart=/home/unitree/Humanoid/GR00T-WholeBodyControl/.venv_camera/bin/python -m gear_sonic.camera.composed_camera \
+#     --ego-view-camera unitree_g1 --ego-view-device-id enP8p1s0 \
+#     --left-wrist-camera realsense --left-wrist-device-id 0 \
+#     --right-wrist-camera realsense --right-wrist-device-id 1 \
 #     --port 5555
 
 Restart=on-failure
