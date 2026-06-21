@@ -72,6 +72,9 @@ class ComposedCameraConfig:
     head_device_id: str | None = None
     """Device ID for head camera."""
 
+    head_enable_depth: bool = False
+    """Enable depth stream for head RealSense camera (requires USB 3.0; default off)."""
+
     left_wrist_camera: str | None = None
     """Camera type for left wrist view."""
 
@@ -144,6 +147,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
                     camera_queue,
                     shutdown_event,
                     error_event,
+                    camera_config.get("enable_depth"),
                 ),
             )
             thread.start()
@@ -169,25 +173,29 @@ class ComposedCameraSensor(Sensor, SensorServer):
     def _get_camera_configs(self) -> dict[str, dict]:
         camera_configs = {}
 
-        if self.config.ego_view_camera is not None:
+        def _enabled(camera_type: str | None) -> bool:
+            return camera_type is not None and camera_type.lower() != "none"
+
+        if _enabled(self.config.ego_view_camera):
             camera_configs[CameraMountPosition.EGO_VIEW.value] = {
                 "camera_type": self.config.ego_view_camera,
                 "device_id": self.config.ego_view_device_id,
             }
 
-        if self.config.head_camera is not None:
+        if _enabled(self.config.head_camera):
             camera_configs[CameraMountPosition.HEAD.value] = {
                 "camera_type": self.config.head_camera,
                 "device_id": self.config.head_device_id,
+                "enable_depth": self.config.head_enable_depth,
             }
 
-        if self.config.left_wrist_camera is not None:
+        if _enabled(self.config.left_wrist_camera):
             camera_configs[CameraMountPosition.LEFT_WRIST.value] = {
                 "camera_type": self.config.left_wrist_camera,
                 "device_id": self.config.left_wrist_device_id,
             }
 
-        if self.config.right_wrist_camera is not None:
+        if _enabled(self.config.right_wrist_camera):
             camera_configs[CameraMountPosition.RIGHT_WRIST.value] = {
                 "camera_type": self.config.right_wrist_camera,
                 "device_id": self.config.right_wrist_device_id,
@@ -235,6 +243,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
         image_queue: queue.Queue,
         shutdown_event: threading.Event,
         error_event: threading.Event,
+        enable_depth: bool | None = None,
     ):
         """Worker thread with auto-reconnection."""
         max_init_retries = 10
@@ -262,7 +271,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
                                 f"[{mount_position}] Initializing camera "
                                 f"(attempt {attempt + 1}/{max_init_retries})..."
                             )
-                        camera = self._instantiate_camera(mount_position, camera_type, device_id)
+                        camera = self._instantiate_camera(mount_position, camera_type, device_id, enable_depth)
                         print(f"[{mount_position}] Camera initialized successfully")
                         break
                     except Exception as e:
@@ -366,7 +375,11 @@ class ComposedCameraSensor(Sensor, SensorServer):
             error_event.set()
 
     def _instantiate_camera(
-        self, mount_position: str, camera_type: str, device_id: str | None = None
+        self,
+        mount_position: str,
+        camera_type: str,
+        device_id: str | None = None,
+        enable_depth: bool | None = None,
     ) -> Sensor:
         """Instantiate a camera sensor based on camera_type (lazy imports)."""
         if camera_type in ("oak", "oak_mono"):
@@ -387,7 +400,8 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 CameraMountPosition.LEFT_WRIST.value,
                 CameraMountPosition.RIGHT_WRIST.value,
             }
-            enable_depth = mount_position not in wrist_mounts
+            if enable_depth is None:
+                enable_depth = mount_position not in wrist_mounts
             rs_config = RealSenseConfig()
             if not enable_depth:
                 rs_config.enable_depth = False

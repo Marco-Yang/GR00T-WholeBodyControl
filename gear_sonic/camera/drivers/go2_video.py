@@ -22,6 +22,8 @@ from gear_sonic.camera.sensor_server import ImageMessageSchema
 class Go2VideoSensor(Sensor):
     """Pulls JPEG frames from Go2 VideoClient and exposes them as ego_view RGB."""
 
+    _channel_initialized: bool = False
+
     def __init__(
         self,
         mount_position: str = "ego_view",
@@ -31,10 +33,12 @@ class Go2VideoSensor(Sensor):
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         from unitree_sdk2py.go2.video.video_client import VideoClient
 
-        if network_interface:
-            ChannelFactoryInitialize(0, network_interface)
-        else:
-            ChannelFactoryInitialize(0)
+        if not Go2VideoSensor._channel_initialized:
+            if network_interface:
+                ChannelFactoryInitialize(0, network_interface)
+            else:
+                ChannelFactoryInitialize(0)
+            Go2VideoSensor._channel_initialized = True
 
         self.mount_position = mount_position
         self._client = VideoClient()

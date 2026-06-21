@@ -48,7 +48,7 @@ class RealSenseConfig:
 class RealSenseSensor(Sensor, SensorServer):
     """Sensor for Intel RealSense depth cameras."""
 
-    _shared_ctx: "rs.context | None" = None
+    _init_lock: "threading.Lock" = None  # type: ignore[assignment]
 
     def __init__(
         self,
@@ -60,9 +60,26 @@ class RealSenseSensor(Sensor, SensorServer):
         device_id: str | None = None,
         enable_depth: bool | None = None,
     ):
-        if RealSenseSensor._shared_ctx is None:
-            RealSenseSensor._shared_ctx = rs.context()
-        devices = list(RealSenseSensor._shared_ctx.query_devices())
+        import threading
+
+        if RealSenseSensor._init_lock is None:
+            RealSenseSensor._init_lock = threading.Lock()
+
+        with RealSenseSensor._init_lock:
+            self._init(run_as_server, port, config, id, mount_position, device_id, enable_depth)
+
+    def _init(
+        self,
+        run_as_server: bool,
+        port: int,
+        config: RealSenseConfig,
+        id: int,
+        mount_position: str,
+        device_id: str | None,
+        enable_depth: bool | None,
+    ):
+        ctx = rs.context()
+        devices = list(ctx.query_devices())
         if len(devices) == 0:
             raise RuntimeError("No RealSense devices found")
 
