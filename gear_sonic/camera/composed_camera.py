@@ -11,8 +11,16 @@ Usage (on robot)::
         --ego-view-device-id 18443010E1ABC12300 \\
         --port 5555
 
-Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
+Supported camera types: ``oak``, ``oak_mono``, ``realsense``, ``go2``,
 ``usb``, or a path to an ``.mp4`` file for replay testing.
+
+Go2 ego view example (wrist OAK + Go2 front RPC on one ZMQ port)::
+
+    python -m gear_sonic.camera.composed_camera \\
+        --ego-view-camera go2 --ego-view-device-id enP8p1s \\
+        --left-wrist-camera oak --left-wrist-device-id <LEFT_MXID> \\
+        --right-wrist-camera oak --right-wrist-device-id <RIGHT_MXID> \\
+        --port 5555
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
@@ -56,7 +64,7 @@ class ComposedCameraConfig:
     """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
 
     ego_view_device_id: str | None = None
-    """Device ID for ego view camera (OAK MxID, RealSense serial, USB /dev/video index)."""
+    """Ego device ID: OAK MxID, RealSense serial, USB index, or Go2 DDS interface name."""
 
     head_camera: str | None = None
     """Camera type for head view."""
@@ -373,10 +381,28 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
 
         elif camera_type == "realsense":
-            from gear_sonic.camera.drivers.realsense import RealSenseSensor
+            from gear_sonic.camera.drivers.realsense import RealSenseConfig, RealSenseSensor
 
-            print(f"Initializing RealSense sensor for camera type: {camera_type}")
-            return RealSenseSensor(mount_position=mount_position)
+            wrist_mounts = {
+                CameraMountPosition.LEFT_WRIST.value,
+                CameraMountPosition.RIGHT_WRIST.value,
+            }
+            enable_depth = mount_position not in wrist_mounts
+            rs_config = RealSenseConfig()
+            if not enable_depth:
+                rs_config.enable_depth = False
+                rs_config.wire_jpeg = True
+            print(
+                f"Initializing RealSense sensor for camera type: {camera_type} "
+                f"(depth={'on' if enable_depth else 'off'}, "
+                f"wire_jpeg={rs_config.wire_jpeg})"
+            )
+            return RealSenseSensor(
+                config=rs_config,
+                mount_position=mount_position,
+                device_id=device_id,
+                enable_depth=enable_depth,
+            )
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
@@ -392,6 +418,15 @@ class ComposedCameraSensor(Sensor, SensorServer):
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
+            )
+
+        elif camera_type == "go2":
+            from gear_sonic.camera.drivers.go2_video import Go2VideoSensor
+
+            print(f"Initializing Go2 RPC video for mount: {mount_position}")
+            return Go2VideoSensor(
+                mount_position=mount_position,
+                network_interface=device_id,
             )
 
         else:
