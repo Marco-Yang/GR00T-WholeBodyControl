@@ -369,30 +369,32 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
     }
 
 
-def get_wrist_camera_features() -> dict:
-    """Features for optional wrist cameras (added when ``record_wrist_cameras`` is enabled)."""
-    return {
-        "observation.images.left_wrist": {
+def get_wrist_camera_features(left: bool = True, right: bool = True) -> dict:
+    """Features for optional wrist cameras."""
+    features = {}
+    if left:
+        features["observation.images.left_wrist"] = {
             "dtype": "video",
             "shape": [WRIST_VIEW_HEIGHT, WRIST_VIEW_WIDTH, 3],
             "names": ["height", "width", "channel"],
-        },
-        "observation.images.right_wrist": {
+        }
+    if right:
+        features["observation.images.right_wrist"] = {
             "dtype": "video",
             "shape": [WRIST_VIEW_HEIGHT, WRIST_VIEW_WIDTH, 3],
             "names": ["height", "width", "channel"],
-        },
-    }
+        }
+    return features
 
 
-def get_wrist_camera_modality_config() -> dict:
+def get_wrist_camera_modality_config(left: bool = True, right: bool = True) -> dict:
     """Modality config entries for optional wrist cameras."""
-    return {
-        "video": {
-            "left_wrist": {"original_key": "observation.images.left_wrist"},
-            "right_wrist": {"original_key": "observation.images.right_wrist"},
-        },
-    }
+    video = {}
+    if left:
+        video["left_wrist"] = {"original_key": "observation.images.left_wrist"}
+    if right:
+        video["right_wrist"] = {"original_key": "observation.images.right_wrist"}
+    return {"video": video} if video else {}
 
 
 def get_g1_robot_model(

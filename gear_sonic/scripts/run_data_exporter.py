@@ -97,8 +97,11 @@ class SonicDataExporterConfig:
     robot_config_timeout: float = 0
     """Seconds to wait for the ZMQ robot_config message at startup (0 = wait forever)."""
 
-    record_wrist_cameras: bool = False
-    """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+    record_left_wrist_camera: bool = False
+    """Record left wrist camera stream. Requires left wrist camera to be available."""
+
+    record_right_wrist_camera: bool = False
+    """Record right wrist camera stream. Requires right wrist camera to be available."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -329,7 +332,9 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                if buffer_size > 0:
+                    self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
@@ -527,15 +532,20 @@ class GrootDataCollector:
         if self.latest_image_msg is None:
             return
         images = self.latest_image_msg["images"]
+        # When no dedicated ego_view camera is present, fall back to head camera
+        camera_key_map: dict[str, str] = {}
+        if "ego_view" not in images and "head" in images:
+            camera_key_map["ego_view"] = "head"
         for feature_name, feature_info in self.data_exporter.features.items():
             if feature_info.get("dtype") in ["image", "video"]:
                 image_key = feature_name.split(".")[-1]
-                if image_key not in images:
+                actual_key = camera_key_map.get(image_key, image_key)
+                if actual_key not in images:
                     raise ValueError(
                         f"Required image '{image_key}' for feature '{feature_name}' "
                         f"not found in image message. Available: {list(images.keys())}"
                     )
-                frame_data[feature_name] = images[image_key]
+                frame_data[feature_name] = images[actual_key]
 
     def _finalize_frame(self, t_start: float) -> bool:
         t_end = time.monotonic()
@@ -914,10 +924,23 @@ def main(config: SonicDataExporterConfig):
     dataset_features = get_features_sonic_vla(g1_rm)
     modality_config = get_modality_config_sonic_vla(g1_rm)
 
-    if config.record_wrist_cameras:
-        print("[Camera] Wrist cameras enabled — adding to dataset schema")
-        dataset_features.update(get_wrist_camera_features())
-        wrist_modality = get_wrist_camera_modality_config()
+    if config.record_left_wrist_camera or config.record_right_wrist_camera:
+        enabled = []
+        if config.record_left_wrist_camera:
+            enabled.append("left_wrist")
+        if config.record_right_wrist_camera:
+            enabled.append("right_wrist")
+        print(f"[Camera] Wrist cameras enabled: {', '.join(enabled)}")
+        dataset_features.update(
+            get_wrist_camera_features(
+                left=config.record_left_wrist_camera,
+                right=config.record_right_wrist_camera,
+            )
+        )
+        wrist_modality = get_wrist_camera_modality_config(
+            left=config.record_left_wrist_camera,
+            right=config.record_right_wrist_camera,
+        )
         for key, value in wrist_modality.items():
             if key in modality_config:
                 modality_config[key].update(value)
@@ -936,7 +959,11 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_left_wrist_camera": config.record_left_wrist_camera,
+            "record_right_wrist_camera": config.record_right_wrist_camera,
+        },
     )
 
     data_collector = GrootDataCollector(
